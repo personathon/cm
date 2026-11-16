@@ -1,0 +1,176 @@
+name: k6 Load Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      swagger_url:
+        description: "URL to the Swagger/OpenAPI spec (e.g. https://myapi.com/swagger.json)"
+        required: true
+      k6_api_url:
+        description: "URL of the k6 generator API (e.g. https://abc123-8000.vscode-tunnel.ms)"
+        required: true
+      tags:
+        description: "API tags to test (comma-separated). Leave empty to test all."
+        required: false
+        default: ""
+
+
+env:
+  K6_DIR: ./k6_tests
+
+jobs:
+  load-test:
+    name: Generate & Run k6 Load Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Install k6 ──────────────────────────────────────────────────────
+      - name: Install k6
+        run: |
+          K6_VERSION=$(curl -sS \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/grafana/k6/releases/latest \
+            | jq -r '.tag_name')
+          echo "Installing k6 ${K6_VERSION}"
+          curl -sS -L \
+            "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+            -o k6.tar.gz
+          tar xzf k6.tar.gz
+          sudo mv "k6-${K6_VERSION}-linux-amd64/k6" /usr/local/bin/k6
+          k6 version
+      # ── 2. Fetch swagger spec from URL ─────────────────────────────────────
+      - name: Fetch Swagger spec
+        run: |
+          SWAGGER_URL="${{ inputs.swagger_url || secrets.SWAGGER_URL }}"
+          curl -f -sS "$SWAGGER_URL" -o swagger.json
+          echo "Fetched spec: $(wc -c < swagger.json) bytes"
+      # ── 3. Build ?tags= query string ───────────────────────────────────────
+      - name: Build tag query params
+        id: tags
+        run: |
+          TAGS="${{ inputs.tags }}"
+          QUERY=""
+          if [ -n "$TAGS" ]; then
+            IFS=',' read -ra TAG_ARR <<< "$TAGS"
+            for tag in "${TAG_ARR[@]}"; do
+              tag=$(echo "$tag" | xargs)
+              QUERY="${QUERY}&tags=${tag}"
+            done
+            QUERY="?${QUERY:1}"
+          fi
+          echo "query=${QUERY}" >> "$GITHUB_OUTPUT"
+      # ── 4. Call generator API → download zip ───────────────────────────────
+      - name: Generate k6 test bundle
+        run: |
+          API_URL="${{ inputs.k6_api_url || secrets.K6_API_URL }}"
+          curl -f -sS -X POST \
+            "${API_URL}/generate${{ steps.tags.outputs.query }}" \
+            -F "file=@swagger.json" \
+            -o k6_tests.zip
+          echo "Downloaded $(du -sh k6_tests.zip | cut -f1) zip"
+      # ── 5. Unzip ───────────────────────────────────────────────────────────
+      - name: Extract test bundle
+        run: |
+          mkdir -p "${{ env.K6_DIR }}"
+          unzip -o k6_tests.zip -d "${{ env.K6_DIR }}/"
+          echo "Extracted files:"
+          ls -lh "${{ env.K6_DIR }}/"
+          if [ -f "${{ env.K6_DIR }}/data.csv" ]; then
+            echo "data_csv=true" >> "$GITHUB_ENV"
+            echo "✅ data.csv present — parameterized test"
+          else
+            echo "data_csv=false" >> "$GITHUB_ENV"
+            echo "ℹ️  No data.csv — public/unauthenticated test"
+          fi
+      # ── 6. Syntax check (k6 inspect — no network calls, fails fast on bad JS) ──
+      - name: Validate k6 script syntax
+        working-directory: ${{ env.K6_DIR }}
+        run: k6 inspect $(ls *.js | head -1)
+
+      # ── 7. Run k6 ──────────────────────────────────────────────────────────
+      - name: Run k6 load test
+        id: k6
+        working-directory: ${{ env.K6_DIR }}
+        run: |
+          set +e
+          k6 run \
+            --vus 1 \
+            --duration 30s \
+            --summary-export=../summary.json \
+            --out json=../results.json \
+            $(ls *.js | head -1) \
+            2>&1 | tee ../k6_output.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+      # ── 7. Parse metrics ───────────────────────────────────────────────────
+      - name: Parse k6 metrics
+        id: metrics
+        if: always()
+        run: |
+          REQS=$(jq -r '.metrics.http_reqs.values.count // 0' summary.json 2>/dev/null || echo 0)
+          ERR_RATE=$(jq -r '((.metrics.http_req_failed.values.rate // 0) * 100) | round' summary.json 2>/dev/null || echo 0)
+          P95=$(jq -r '(.metrics.http_req_duration.values["p(95)"] // 0) | round' summary.json 2>/dev/null || echo 0)
+          AVG=$(jq -r '(.metrics.http_req_duration.values.avg // 0) | round' summary.json 2>/dev/null || echo 0)
+          VUS=$(jq -r '.metrics.vus_max.values.max // 0' summary.json 2>/dev/null || echo 0)
+          CHECKS_PASS=$(jq -r '.metrics.checks.values.passes // 0' summary.json 2>/dev/null || echo 0)
+          CHECKS_FAIL=$(jq -r '.metrics.checks.values.fails // 0' summary.json 2>/dev/null || echo 0)
+          if [ "${{ steps.k6.outputs.exit_code }}" = "0" ]; then
+            STATUS="Passed" ; ICON="✅"
+          else
+            STATUS="Failed" ; ICON="❌"
+          fi
+          echo "reqs=$REQS"               >> "$GITHUB_OUTPUT"
+          echo "err_rate=$ERR_RATE"       >> "$GITHUB_OUTPUT"
+          echo "p95=$P95"                 >> "$GITHUB_OUTPUT"
+          echo "avg=$AVG"                 >> "$GITHUB_OUTPUT"
+          echo "vus=$VUS"                 >> "$GITHUB_OUTPUT"
+          echo "checks_pass=$CHECKS_PASS" >> "$GITHUB_OUTPUT"
+          echo "checks_fail=$CHECKS_FAIL" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS"           >> "$GITHUB_OUTPUT"
+          echo "icon=$ICON"               >> "$GITHUB_OUTPUT"
+          if [ "$data_csv" = "true" ]; then
+            echo "parameterized=Yes (data.csv)" >> "$GITHUB_OUTPUT"
+          else
+            echo "parameterized=No" >> "$GITHUB_OUTPUT"
+          fi
+      # ── 8. Upload artifacts ────────────────────────────────────────────────
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results-${{ github.run_number }}
+          path: |
+            k6_output.txt
+            summary.json
+            results.json
+      # ── 9. Always print the run URL first (visible even if later steps fail) ──
+      - name: Print run URL
+        if: always()
+        run: |
+          echo ""
+          echo "  👉 Full report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+      # ── 10. Print summary + full k6 output ────────────────────────────────
+      - name: Print test summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  k6 Load Test — ${{ steps.metrics.outputs.icon }} ${{ steps.metrics.outputs.status }}"
+          echo "========================================"
+          echo "  Repository    : ${{ github.repository }}"
+          echo "  Branch        : ${{ github.ref_name }}"
+          echo "  Run           : #${{ github.run_number }}"
+          echo "  Virtual Users : ${{ steps.metrics.outputs.vus }}"
+          echo "  Total Requests: ${{ steps.metrics.outputs.reqs }}"
+          echo "  Error Rate    : ${{ steps.metrics.outputs.err_rate }}%"
+          echo "  Avg Response  : ${{ steps.metrics.outputs.avg }} ms"
+          echo "  p95 Response  : ${{ steps.metrics.outputs.p95 }} ms"
+          echo "  Checks Passed : ${{ steps.metrics.outputs.checks_pass }}"
+          echo "  Checks Failed : ${{ steps.metrics.outputs.checks_fail }}"
+          echo "  Parameterized : ${{ steps.metrics.outputs.parameterized }}"
+          echo "========================================"
+          echo "  👉 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "========================================"
+          echo ""
+          echo "──────── k6 Output ─────────────────────"
+          cat k6_output.txt 2>/dev/null || echo "(no output)"
