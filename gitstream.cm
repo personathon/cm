@@ -1,0 +1,23 @@
+# Organization-wide gitStream automation.
+# This file belongs at the ROOT of the organization's special `cm` repository.
+# Do not place it under .cm/.
+
+manifest:
+  version: 1.0
+
+automations:
+  org_performance_ai_review:
+    if:
+      - {{ pr.target == 'main' }}
+      - {{ not pr.draft }}
+      - {{ not (is.bot_author or is.bot_branch) }}
+    run:
+      - action: code-review@v1
+        args:
+          approve_on_LGTM: false
+          issues_limit: 5
+          guidelines: {{ "./performance-review-rules/COMBINED_PERF_RULES.md" | readFile() | dump }}
+
+is:
+  bot_author: {{ pr.author | match(list=['github-actions', '_bot_', '[bot]', 'dependabot']) | some }}
+  bot_branch: {{ branch.name | match(list=['renovate/', 'dependabot/']) | some }}
