@@ -20,6 +20,7 @@ automations:
       - merge
     if:
       - {{ pr.target == 'main' }}
+      - {{ not (is.bot_author or is.bot_branch) }}
     run:
       - action: run-github-workflow@v1
         args:
@@ -27,7 +28,8 @@ automations:
           repo: cm
           workflow: .github/workflows/perfrun.yml
           ref: main
-          inputs: "source_repo={{ repo.owner }}/{{ repo.name }}"
+          inputs: source_repo={{ repo.owner }}/{{ repo.name }}
+          check_name: Central k6 Performance Test
 
 is:
   bot_author: {{ pr.author | match(list=['github-actions', '_bot_', '[bot]', 'dependabot']) | some }}
