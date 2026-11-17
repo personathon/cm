@@ -370,47 +370,6 @@ jobs:
           echo "AI summary saved to ai_summary.md"
 
       # ── 14. Post AI summary to the original application PR ──
-      - name: Post AI summary to application PR
-        if: always() && inputs.source_repo != '' && inputs.pr_number != ''
-        env:
-          GH_TOKEN: ${{ secrets.crossrepo }}
-          SOURCE_REPO: ${{ inputs.source_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          if [ ! -f ai_summary.md ]; then
-            echo "ai_summary.md not found; skipping PR comment."
-            exit 0
-          fi
-
-          if [ -z "$GH_TOKEN" ]; then
-            echo "CROSS_REPO_COMMENT_TOKEN is not configured."
-            exit 1
-          fi
-
-          if ! [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "Invalid source repository: $SOURCE_REPO"
-            exit 1
-          fi
-
-          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-            echo "Invalid PR number: $PR_NUMBER"
-            exit 1
-          fi
-
-          jq -n \
-            --arg run_url "$RUN_URL" \
-            --rawfile summary ai_summary.md \
-            '{body: ("## k6 Performance AI Summary\n\n" + $summary + "\n\n[View full workflow run](" + $run_url + ")")}' \
-            | gh api \
-                --method POST \
-                "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
-                --input -
-
-          echo "AI summary posted to ${SOURCE_REPO}#${PR_NUMBER}"
-
       # ── 15. Print run URL ───────────────────────────────────
       - name: Print run URL
         if: always()
