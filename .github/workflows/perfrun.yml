@@ -369,10 +369,8 @@ jobs:
 
           echo "AI summary saved to ai_summary.md"
 
-<<<<<<< HEAD
       # ── 14. Post AI summary to the original application PR ──
       # ── 15. Print run URL ───────────────────────────────────
-=======
       # ── 14. Generate a scoped GitHub App installation token ──
       - name: Generate AI Reporter GitHub token
         id: ai-reporter-token
@@ -424,7 +422,6 @@ jobs:
           echo "AI summary posted to ${SOURCE_REPO}#${PR_NUMBER}"
 
       # ── 16. Print run URL ───────────────────────────────────
->>>>>>> b8824fe (Update files)
       - name: Print run URL
         if: always()
         run: |
