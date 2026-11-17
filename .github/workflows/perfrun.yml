@@ -13,7 +13,12 @@ on:
         type: string
         required: false
         default: ""
-
+        
+      pr_number:
+        description: 'Original application PR number'
+        required: false
+        type: string
+        
       swagger_url:
         description: "Optional Swagger/OpenAPI URL for manual execution"
         type: string
