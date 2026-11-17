@@ -28,6 +28,7 @@ automations:
           repo: cm
           workflow: .github/workflows/perfrun.yml
           ref: main
+          inputs: "source_repo={{ repo.owner }}/{{ repo.name }}"
 
 is:
   bot_author: {{ pr.author | match(list=['github-actions', '_bot_', '[bot]', 'dependabot']) | some }}
