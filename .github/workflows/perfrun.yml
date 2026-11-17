@@ -369,8 +369,62 @@ jobs:
 
           echo "AI summary saved to ai_summary.md"
 
+<<<<<<< HEAD
       # ── 14. Post AI summary to the original application PR ──
       # ── 15. Print run URL ───────────────────────────────────
+=======
+      # ── 14. Generate a scoped GitHub App installation token ──
+      - name: Generate AI Reporter GitHub token
+        id: ai-reporter-token
+        if: always() && inputs.source_repo != '' && inputs.pr_number != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.AI_REPORTER_CLIENT_ID }}
+          private-key: ${{ secrets.AI_REPORTER_PRIVATE_KEY }}
+          owner: personathon
+          repositories: ${{ inputs.source_repo }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      # ── 15. Post AI summary to the original application PR ──
+      - name: Post AI summary to application PR
+        if: always() && inputs.source_repo != '' && inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.ai-reporter-token.outputs.token }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f ai_summary.md ]; then
+            echo "ai_summary.md not found; skipping PR comment."
+            exit 0
+          fi
+
+          if ! [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid source repository: $SOURCE_REPO"
+            exit 1
+          fi
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          jq -n \
+            --arg run_url "$RUN_URL" \
+            --rawfile summary ai_summary.md \
+            '{body: ("## k6 Performance AI Summary\n\n" + $summary + "\n\n[View full workflow run](" + $run_url + ")")}' \
+            | gh api \
+                --method POST \
+                "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
+                --input -
+
+          echo "AI summary posted to ${SOURCE_REPO}#${PR_NUMBER}"
+
+      # ── 16. Print run URL ───────────────────────────────────
+>>>>>>> b8824fe (Update files)
       - name: Print run URL
         if: always()
         run: |
@@ -381,7 +435,7 @@ jobs:
           echo "AI verdict: ${{ steps.analyse.outputs.verdict }}"
           echo ""
 
-      # ── 16. Print test summary ──────────────────────────────
+      # ── 17. Print test summary ──────────────────────────────
       - name: Print test summary
         if: always()
         run: |
@@ -419,7 +473,7 @@ jobs:
 
           cat k6_output.txt 2>/dev/null || echo "(no output)"
 
-      # ── 17. Fail workflow if k6 execution failed ────────────
+      # ── 18. Fail workflow if k6 execution failed ────────────
       - name: Fail workflow if k6 failed
         if: always() && steps.k6.outputs.exit_code != '0'
         run: |
