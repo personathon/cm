@@ -1,6 +1,3 @@
-# Organization-wide gitStream automation.
-# This file belongs at the ROOT of the organization's special `cm` repository.
-# Do not place it under .cm/.
 
 manifest:
   version: 1.0
@@ -17,6 +14,20 @@ automations:
           approve_on_LGTM: false
           issues_limit: 5
           guidelines: {{ "./performance-review-rules/COMBINED_PERF_RULES.md" | readFile() | dump }}
+
+  org_k6_load_test_after_merge:
+    on:
+      - merge
+    if:
+      - {{ pr.target == 'main' }}
+      - {{ not (is.bot_author or is.bot_branch) }}
+    run:
+      - action: run-github-workflow@v1
+        args:
+          owner: personathon
+          repo: cm
+          workflow: .github/workflows/perfrun.yml
+          ref: main
 
 is:
   bot_author: {{ pr.author | match(list=['github-actions', '_bot_', '[bot]', 'dependabot']) | some }}
