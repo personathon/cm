@@ -9,26 +9,23 @@ automations:
       - {{ not pr.draft }}
       - {{ not (is.bot_author or is.bot_branch) }}
     run:
+      # First: LinearB AI code review
       - action: code-review@v1
         args:
           approve_on_LGTM: false
           issues_limit: 5
           guidelines: {{ "./performance-review-rules/COMBINED_PERF_RULES.md" | readFile() | dump }}
 
-  org_k6_load_test_after_merge:
-    on:
-      - merge
-    if:
-      - {{ pr.target == 'main' }}
-      - {{ not (is.bot_author or is.bot_branch) }}
-    run:
+      # Second: Trigger central k6 workflow after review completes
       - action: run-github-workflow@v1
         args:
           owner: personathon
           repo: cm
           workflow: .github/workflows/perfrun.yml
           ref: main
-          inputs: source_repo={{ repo.owner }}/{{ repo.name }}
+          inputs: |
+            source_repo={{ repo.owner }}/{{ repo.name }}
+            pr_number={{ pr.number }}
           check_name: Central k6 Performance Test
 
 is:
