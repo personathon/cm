@@ -8,9 +8,7 @@ on:
   push:
     branches:
       - main
-    types:
-      - closed
-
+      
   # Retain manual execution with three user inputs.
   workflow_dispatch:
     inputs:
