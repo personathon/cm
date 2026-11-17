@@ -94,3 +94,375 @@ jobs:
           SWAGGER_URL_MAP: ${{ vars.SWAGGER_URL_MAP }}
           AUTO_SWAGGER_URL: ${{ vars.SWAGGER_URL }}
         run: |
+          set -euo pipefail
+
+          if [ -n "$SOURCE_REPO" ]; then
+            echo "Resolving Swagger URL for $SOURCE_REPO"
+
+            if [ -z "$SWAGGER_URL_MAP" ]; then
+              echo "ERROR: SWAGGER_URL_MAP repository variable is empty or missing"
+              exit 1
+            fi
+
+            SWAGGER_URL=$(jq -er --arg repo "$SOURCE_REPO" \
+              '.[$repo] // empty' <<< "$SWAGGER_URL_MAP") || {
+                echo "ERROR: No Swagger URL mapping found for $SOURCE_REPO"
+                exit 1
+              }
+          elif [ -n "$DISPATCH_SWAGGER_URL" ]; then
+            # Manual execution with an explicitly supplied Swagger URL.
+            SWAGGER_URL="$DISPATCH_SWAGGER_URL"
+          else
+            # Backward-compatible fallback for manual runs using the legacy variable.
+            SWAGGER_URL="$AUTO_SWAGGER_URL"
+          fi
+
+          if [ -z "$SWAGGER_URL" ]; then
+            echo "ERROR: Swagger URL is not configured"
+            exit 1
+          fi
+
+          echo "Fetching Swagger specification..."
+          curl -f -sS "$SWAGGER_URL" -o swagger.json
+          echo "Fetched spec: $(wc -c < swagger.json) bytes"
+
+      # ── 3. Build tags query parameters ──────────────────────
+      - name: Build tag query params
+        id: tags
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          DISPATCH_TAGS: ${{ inputs.tags }}
+          AUTO_TAGS: ${{ vars.K6_TAGS }}
+        run: |
+          if [ -n "$SOURCE_REPO" ]; then
+            TAGS="$AUTO_TAGS"
+          else
+            # For manual runs, an empty input intentionally means all APIs.
+            TAGS="$DISPATCH_TAGS"
+          fi
+
+          QUERY=""
+
+          if [ -n "$TAGS" ]; then
+            QUERY=$(TAGS="$TAGS" python3 -c '
+          import os
+          from urllib.parse import urlencode
+
+          tags = [
+              tag.strip()
+              for tag in os.environ["TAGS"].split(",")
+              if tag.strip()
+          ]
+
+          print(
+              "?" + urlencode([("tags", tag) for tag in tags])
+              if tags else ""
+          )
+          ')
+          fi
+
+          echo "query=${QUERY}" >> "$GITHUB_OUTPUT"
+          echo "Selected tags: ${TAGS:-ALL}"
+
+      # ── 4. Resolve generator API URL ────────────────────────
+      - name: Resolve generator API URL
+        id: api
+        env:
+          DISPATCH_API_URL: ${{ inputs.k6_api_url }}
+          AUTO_API_URL: ${{ vars.K6_API_URL }}
+        run: |
+          API_URL="${DISPATCH_API_URL:-$AUTO_API_URL}"
+
+          if [ -z "$API_URL" ]; then
+            echo "ERROR: K6_API_URL is not configured"
+            exit 1
+          fi
+
+          API_URL="${API_URL%/}"
+
+          echo "url=$API_URL" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Generate k6 bundle ───────────────────────────────
+      - name: Generate k6 test bundle
+        env:
+          API_URL: ${{ steps.api.outputs.url }}
+          TAG_QUERY: ${{ steps.tags.outputs.query }}
+        run: |
+          echo "Calling k6 generator API..."
+
+          curl -f -sS -X POST \
+            "${API_URL}/generate${TAG_QUERY}" \
+            -F "file=@swagger.json" \
+            -o k6_tests.zip
+
+          echo "Downloaded $(du -sh k6_tests.zip | cut -f1) zip"
+
+      # ── 6. Extract generated k6 project ──────────────────────
+      - name: Extract test bundle
+        id: extract
+        run: |
+          mkdir -p "${K6_DIR}"
+
+          unzip -o k6_tests.zip -d "${K6_DIR}/"
+
+          echo "Extracted files:"
+          ls -lh "${K6_DIR}/"
+
+          echo "data_csv=false" >> "$GITHUB_ENV"
+
+          if [ -f "${K6_DIR}/data.csv" ]; then
+            echo "data_csv=true" >> "$GITHUB_ENV"
+            echo "data.csv present — parameterized test"
+          else
+            echo "No data.csv — public/unauthenticated test"
+          fi
+
+          K6_SCRIPT=$(find "${K6_DIR}" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.js' \
+            -printf '%f\n' | sort | head -n 1)
+
+          if [ -z "$K6_SCRIPT" ]; then
+            echo "ERROR: No JavaScript k6 script found"
+            exit 1
+          fi
+
+          echo "script=$K6_SCRIPT" >> "$GITHUB_OUTPUT"
+
+      # ── 7. Validate k6 script syntax ────────────────────────
+      - name: Validate k6 script syntax
+        working-directory: ${{ env.K6_DIR }}
+        run: |
+          k6 inspect "${{ steps.extract.outputs.script }}"
+
+      # ── 8. Execute k6 load test ─────────────────────────────
+      - name: Run k6 load test
+        id: k6
+        working-directory: ${{ env.K6_DIR }}
+        run: |
+          set +e
+
+          k6 run \
+            --vus 1 \
+            --duration 30s \
+            --summary-export=../summary.json \
+            --out json=../results.json \
+            "${{ steps.extract.outputs.script }}" \
+            2>&1 | tee ../k6_output.txt
+
+          K6_EXIT=${PIPESTATUS[0]}
+
+          echo "exit_code=$K6_EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "k6 exit code: $K6_EXIT"
+
+          # Continue to publish reports even when k6 fails.
+          exit 0
+
+      # ── 9. Parse k6 metrics ─────────────────────────────────
+      - name: Parse k6 metrics
+        id: metrics
+        if: always()
+        env:
+          K6_EXIT_CODE: ${{ steps.k6.outputs.exit_code }}
+        run: |
+          REQS=$(jq -r '.metrics.http_reqs.values.count // 0' summary.json 2>/dev/null || echo 0)
+
+          ERR_RATE=$(jq -r '((.metrics.http_req_failed.values.rate // 0) * 100) | round' summary.json 2>/dev/null || echo 0)
+
+          P95=$(jq -r '(.metrics.http_req_duration.values["p(95)"] // 0) | round' summary.json 2>/dev/null || echo 0)
+
+          AVG=$(jq -r '(.metrics.http_req_duration.values.avg // 0) | round' summary.json 2>/dev/null || echo 0)
+
+          VUS=$(jq -r '.metrics.vus_max.values.max // 0' summary.json 2>/dev/null || echo 0)
+
+          CHECKS_PASS=$(jq -r '.metrics.checks.values.passes // 0' summary.json 2>/dev/null || echo 0)
+
+          CHECKS_FAIL=$(jq -r '.metrics.checks.values.fails // 0' summary.json 2>/dev/null || echo 0)
+
+          if [ "$K6_EXIT_CODE" = "0" ]; then
+            STATUS="Passed"
+            ICON="SUCCESS"
+          else
+            STATUS="Failed"
+            ICON="FAILED"
+          fi
+
+          echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
+          echo "err_rate=$ERR_RATE" >> "$GITHUB_OUTPUT"
+          echo "p95=$P95" >> "$GITHUB_OUTPUT"
+          echo "avg=$AVG" >> "$GITHUB_OUTPUT"
+          echo "vus=$VUS" >> "$GITHUB_OUTPUT"
+          echo "checks_pass=$CHECKS_PASS" >> "$GITHUB_OUTPUT"
+          echo "checks_fail=$CHECKS_FAIL" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "icon=$ICON" >> "$GITHUB_OUTPUT"
+
+          if [ "${data_csv:-false}" = "true" ]; then
+            echo "parameterized=Yes (data.csv)" >> "$GITHUB_OUTPUT"
+          else
+            echo "parameterized=No" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 10. Upload raw k6 results ───────────────────────────
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results-${{ github.run_number }}
+          path: |
+            k6_output.txt
+            summary.json
+            results.json
+          if-no-files-found: warn
+
+      # ── 11. Generate custom HTML report ─────────────────────
+      - name: Generate HTML report
+        if: always()
+        run: |
+          if [ -f results.json ] && [ -f .github/workflows/generate_html.py ]; then
+            mkdir -p report
+
+            python3 .github/workflows/generate_html.py results.json -o report/index.html
+
+            echo "HTML report generated"
+          else
+            echo "HTML report skipped: results.json or generate_html.py missing"
+          fi
+
+      # ── 12. Upload HTML report ──────────────────────────────
+      - name: Upload HTML report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-html-report-${{ github.run_number }}
+          path: report/index.html
+          if-no-files-found: warn
+
+      # ── 13. AI analysis: GO / NO-GO verdict ─────────────────
+      - name: Analyse k6 results
+        id: analyse
+        if: always()
+        env:
+          API_URL: ${{ steps.api.outputs.url }}
+        run: |
+          if [ ! -f results.json ] || [ -z "$API_URL" ]; then
+            echo "verdict=UNKNOWN" >> "$GITHUB_OUTPUT"
+            echo "Analysis skipped: results or API URL unavailable." > ai_summary.md
+            cat ai_summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          RESPONSE=$(curl -f -sS -X POST \
+            "${API_URL}/analyse" \
+            -F "file=@results.json" \
+            2>/dev/null || echo '{"verdict":"UNKNOWN","markdown":"Analysis skipped — API unreachable."}')
+
+          VERDICT=$(printf '%s' "$RESPONSE" | jq -r '.verdict // "UNKNOWN"')
+          MARKDOWN=$(printf '%s' "$RESPONSE" | jq -r '.markdown // "AI analysis returned no summary."')
+
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+
+          printf '%s\n' "$MARKDOWN" > ai_summary.md
+          cat ai_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+          echo "AI summary saved to ai_summary.md"
+
+      # ── 14. Post AI summary to the original application PR ──
+      - name: Post AI summary to application PR
+        if: always() && inputs.source_repo != '' && inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_COMMENT_TOKEN }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f ai_summary.md ]; then
+            echo "ai_summary.md not found; skipping PR comment."
+            exit 0
+          fi
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "CROSS_REPO_COMMENT_TOKEN is not configured."
+            exit 1
+          fi
+
+          if ! [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid source repository: $SOURCE_REPO"
+            exit 1
+          fi
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          jq -n \
+            --arg run_url "$RUN_URL" \
+            --rawfile summary ai_summary.md \
+            '{body: ("## k6 Performance AI Summary\n\n" + $summary + "\n\n[View full workflow run](" + $run_url + ")")}' \
+            | gh api \
+                --method POST \
+                "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
+                --input -
+
+          echo "AI summary posted to ${SOURCE_REPO}#${PR_NUMBER}"
+
+      # ── 15. Print run URL ───────────────────────────────────
+      - name: Print run URL
+        if: always()
+        run: |
+          echo ""
+          echo "Actions run:"
+          echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "AI verdict: ${{ steps.analyse.outputs.verdict }}"
+          echo ""
+
+      # ── 16. Print test summary ──────────────────────────────
+      - name: Print test summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  k6 Load Test — ${{ steps.metrics.outputs.icon }}"
+          echo "  Status: ${{ steps.metrics.outputs.status }}"
+          echo "  AI Verdict: ${{ steps.analyse.outputs.verdict }}"
+          echo "========================================"
+
+          echo "Workflow repo  : ${{ github.repository }}"
+          echo "Source repo    : ${{ inputs.source_repo || 'Manual execution' }}"
+          echo "Branch         : ${{ github.ref_name }}"
+          echo "Event         : ${{ github.event_name }}"
+          echo "Run           : #${{ github.run_number }}"
+
+          echo "Virtual Users : ${{ steps.metrics.outputs.vus }}"
+          echo "Total Requests: ${{ steps.metrics.outputs.reqs }}"
+          echo "Error Rate    : ${{ steps.metrics.outputs.err_rate }}%"
+          echo "Avg Response  : ${{ steps.metrics.outputs.avg }} ms"
+          echo "p95 Response  : ${{ steps.metrics.outputs.p95 }} ms"
+
+          echo "Checks Passed : ${{ steps.metrics.outputs.checks_pass }}"
+          echo "Checks Failed : ${{ steps.metrics.outputs.checks_fail }}"
+
+          echo "Parameterized : ${{ steps.metrics.outputs.parameterized }}"
+
+          echo "========================================"
+
+          echo "Actions report:"
+          echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "========================================"
+          echo ""
+          echo "-------- k6 Output --------"
+
+          cat k6_output.txt 2>/dev/null || echo "(no output)"
+
+      # ── 17. Fail workflow if k6 execution failed ────────────
+      - name: Fail workflow if k6 failed
+        if: always() && steps.k6.outputs.exit_code != '0'
+        run: |
+          echo "k6 execution failed."
+          exit 1
