@@ -20,7 +20,6 @@ automations:
       - merge
     if:
       - {{ pr.target == 'main' }}
-      - {{ not (is.bot_author or is.bot_branch) }}
     run:
       - action: run-github-workflow@v1
         args:
