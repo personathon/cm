@@ -38,11 +38,7 @@ jobs:
   load-test:
     name: Generate & Run k6 Load Test
 
-    # Execute only for merged PRs or manual dispatch.
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.merged == true)
+    # Execute only for merged PRs or manual dispatch
 
     runs-on: ubuntu-latest
 
