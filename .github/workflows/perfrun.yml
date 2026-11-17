@@ -4,23 +4,27 @@ name: k6 Load Test
 run-name: k6 Load Test - ${{ github.actor }}
 
 on:
-  # Automatically trigger when a PR is closed against main.
-  push:
-    branches:
-      - main
-      
-  # Retain manual execution with three user inputs.
+  # Triggered by the central GitStream automation after a PR is merged into main.
+  # Manual execution is retained for troubleshooting and one-off tests.
   workflow_dispatch:
     inputs:
-      swagger_url:
-        description: "URL to the Swagger/OpenAPI specification"
+      source_repo:
+        description: "Merged application repository (owner/repo), supplied by GitStream"
         type: string
-        required: true
+        required: false
+        default: ""
+
+      swagger_url:
+        description: "Optional Swagger/OpenAPI URL for manual execution"
+        type: string
+        required: false
+        default: ""
 
       k6_api_url:
-        description: "URL of the k6 generator API"
+        description: "Optional k6 generator API URL; defaults to K6_API_URL variable"
         type: string
-        required: true
+        required: false
+        default: ""
 
       tags:
         description: "API tags (comma-separated). Leave empty to test all."
@@ -44,7 +48,7 @@ jobs:
 
     steps:
 
-      # ── 0. Checkout merged repository code ──────────────────
+      # ── 0. Checkout central CM repository ──────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -77,15 +81,34 @@ jobs:
 
           k6 version
 
-      # ── 2. Fetch Swagger specification ─────────────────────
-      - name: Fetch Swagger spec
+      # ── 2. Resolve and fetch Swagger specification ───────────
+      - name: Resolve and fetch Swagger spec
         env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
           DISPATCH_SWAGGER_URL: ${{ inputs.swagger_url }}
+          SWAGGER_URL_MAP: ${{ vars.SWAGGER_URL_MAP }}
           AUTO_SWAGGER_URL: ${{ vars.SWAGGER_URL }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+          set -euo pipefail
+
+          if [ -n "$SOURCE_REPO" ]; then
+            echo "Resolving Swagger URL for $SOURCE_REPO"
+
+            if [ -z "$SWAGGER_URL_MAP" ]; then
+              echo "ERROR: SWAGGER_URL_MAP repository variable is empty or missing"
+              exit 1
+            fi
+
+            SWAGGER_URL=$(jq -er --arg repo "$SOURCE_REPO" \
+              '.[$repo] // empty' <<< "$SWAGGER_URL_MAP") || {
+                echo "ERROR: No Swagger URL mapping found for $SOURCE_REPO"
+                exit 1
+              }
+          elif [ -n "$DISPATCH_SWAGGER_URL" ]; then
+            # Manual execution with an explicitly supplied Swagger URL.
             SWAGGER_URL="$DISPATCH_SWAGGER_URL"
           else
+            # Backward-compatible fallback for manual runs using the legacy variable.
             SWAGGER_URL="$AUTO_SWAGGER_URL"
           fi
 
@@ -95,22 +118,22 @@ jobs:
           fi
 
           echo "Fetching Swagger specification..."
-
           curl -f -sS "$SWAGGER_URL" -o swagger.json
-
           echo "Fetched spec: $(wc -c < swagger.json) bytes"
 
       # ── 3. Build tags query parameters ──────────────────────
       - name: Build tag query params
         id: tags
         env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
           DISPATCH_TAGS: ${{ inputs.tags }}
           AUTO_TAGS: ${{ vars.K6_TAGS }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            TAGS="$DISPATCH_TAGS"
-          else
+          if [ -n "$SOURCE_REPO" ]; then
             TAGS="$AUTO_TAGS"
+          else
+            # For manual runs, an empty input intentionally means all APIs.
+            TAGS="$DISPATCH_TAGS"
           fi
 
           QUERY=""
@@ -143,11 +166,7 @@ jobs:
           DISPATCH_API_URL: ${{ inputs.k6_api_url }}
           AUTO_API_URL: ${{ vars.K6_API_URL }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            API_URL="$DISPATCH_API_URL"
-          else
-            API_URL="$AUTO_API_URL"
-          fi
+          API_URL="${DISPATCH_API_URL:-$AUTO_API_URL}"
 
           if [ -z "$API_URL" ]; then
             echo "ERROR: K6_API_URL is not configured"
@@ -297,10 +316,10 @@ jobs:
       - name: Generate HTML report
         if: always()
         run: |
-          if [ -f results.json ] && [ -f generate_html.py ]; then
+          if [ -f results.json ] && [ -f .github/workflows/generate_html.py ]; then
             mkdir -p report
 
-            python3 generate_html.py results.json -o report/index.html
+            python3 .github/workflows/generate_html.py results.json -o report/index.html
 
             echo "HTML report generated"
           else
@@ -361,8 +380,9 @@ jobs:
           echo "  AI Verdict: ${{ steps.analyse.outputs.verdict }}"
           echo "========================================"
 
-          echo "Repository    : ${{ github.repository }}"
-          echo "Branch        : ${{ github.ref_name }}"
+          echo "Workflow repo  : ${{ github.repository }}"
+          echo "Source repo    : ${{ inputs.source_repo || 'Manual execution' }}"
+          echo "Branch         : ${{ github.ref_name }}"
           echo "Event         : ${{ github.event_name }}"
           echo "Run           : #${{ github.run_number }}"
 
