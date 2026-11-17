@@ -373,7 +373,7 @@ jobs:
       - name: Post AI summary to application PR
         if: always() && inputs.source_repo != '' && inputs.pr_number != ''
         env:
-          GH_TOKEN: ${{ secrets.CROSS_REPO_COMMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.crossrepo }}
           SOURCE_REPO: ${{ inputs.source_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
