@@ -23,9 +23,9 @@ automations:
           repo: cm
           workflow: .github/workflows/perfrun.yml
           ref: main
-          inputs: |
-            source_repo={{ repo.owner }}/{{ repo.name }}
-            pr_number={{ pr.number }}
+          inputs:
+            source_repo: "{{ repo.owner }}/{{ repo.name }}"
+            pr_number: "{{ pr.number }}"
           check_name: Central k6 Performance Test
 
 is:
